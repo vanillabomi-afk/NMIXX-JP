@@ -29,6 +29,7 @@ import sys
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import unquote
 
 import feedparser
 import requests
@@ -103,6 +104,32 @@ def to_x_url(link: str, instance: str) -> str:
     return f"https://x.com{path.split('#')[0]}"
 
 
+def rewrite_nitter_proxy_url(url: str) -> str:
+    """Nitter proxies media through its own /pic/ or /video/ routes. Public
+    instances are often behind bot-protection that blocks server-to-server
+    fetches — including Discord's own embed crawler — even though the URL
+    works fine in a browser. Unwrap back to the original twimg.com CDN URL
+    when possible, since that's what Discord can reliably fetch and render.
+    """
+    m = re.search(r"/(?:pic|video)/(.+)$", url)
+    if not m:
+        return url
+    decoded = unquote(m.group(1))
+
+    # The decoded remainder may have an extra segment (e.g. a numeric video ID)
+    # before the actual original URL — search for it rather than assuming
+    # it's at the very start.
+    embedded = re.search(r"https?://\S+", decoded)
+    if embedded:
+        return embedded.group(0)
+
+    if decoded.startswith("media/"):
+        return f"https://pbs.twimg.com/{decoded}"
+    if decoded.startswith("ext_tw_video") or decoded.startswith("amplify_video"):
+        return f"https://video.twimg.com/{decoded}"
+    return url
+
+
 def absolutize(url: str, instance: str) -> str:
     if url.startswith("http"):
         return url
@@ -133,10 +160,12 @@ def extract_media(soup: BeautifulSoup, entry, instance: str) -> tuple[list[str],
     video_url: str | None = None
 
     def add_image(url: str | None) -> None:
-        if url and "emoji" not in url:
-            full = absolutize(url, instance)
-            if full not in images:
-                images.append(full)
+        if not url or "emoji" in url:
+            return
+        rewritten = rewrite_nitter_proxy_url(url)
+        final = rewritten if rewritten != url else absolutize(url, instance)
+        if final not in images:
+            images.append(final)
 
     for img in soup.find_all("img"):
         add_image(img.get("src") or img.get("data-src"))
@@ -149,7 +178,8 @@ def extract_media(soup: BeautifulSoup, entry, instance: str) -> tuple[list[str],
     for video in soup.find_all("video"):
         src = video.get("src")
         if src:
-            video_url = absolutize(src, instance)
+            rewritten = rewrite_nitter_proxy_url(src)
+            video_url = rewritten if rewritten != src else absolutize(src, instance)
         elif not video_url and video.get("poster"):
             add_image(video.get("poster"))
 
