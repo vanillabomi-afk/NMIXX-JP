@@ -42,8 +42,8 @@ DEFAULT_INSTANCES = [
     "https://xcancel.com",
 ]
 
-_RT_MATCH = re.compile(r"^RT @(\w+):\s*(.*)$", re.DOTALL)
-_REPLY_MATCH = re.compile(r"^R to @(\w+):\s*(.*)$", re.DOTALL)
+_RT_MATCH = re.compile(r"^RT(?:\s+by)?\s+@(\w+):\s*", re.IGNORECASE)
+_REPLY_MATCH = re.compile(r"^R\s+to\s+@(\w+):\s*", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
@@ -109,6 +109,72 @@ def absolutize(url: str, instance: str) -> str:
     return f"{instance}{url if url.startswith('/') else '/' + url}"
 
 
+def extract_body_text(description_html: str) -> str:
+    """Pull the tweet's own text out of the RSS description, preserving line breaks.
+
+    RSS titles are flattened to a single line, so we prefer the description's
+    HTML — converting <br> tags to real newlines before stripping markup —
+    to keep the tweet's original formatting.
+    """
+    soup = BeautifulSoup(description_html, "html.parser")
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    text = soup.get_text()
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_media(soup: BeautifulSoup, entry, instance: str) -> tuple[list[str], str | None]:
+    """Find images/video from every place Nitter (across versions/instances) tends
+    to put them: inline <img>/<video><source>, and RSS <enclosure> / media:content
+    elements, which some Nitter builds use instead of (or in addition to) inline HTML."""
+    images: list[str] = []
+    video_url: str | None = None
+
+    def add_image(url: str | None) -> None:
+        if url and "emoji" not in url:
+            full = absolutize(url, instance)
+            if full not in images:
+                images.append(full)
+
+    for img in soup.find_all("img"):
+        add_image(img.get("src") or img.get("data-src"))
+
+    for source in soup.find_all("source"):
+        candidate = source.get("srcset") or source.get("src")
+        if candidate:
+            add_image(candidate.split(",")[0].strip().split(" ")[0])
+
+    for video in soup.find_all("video"):
+        src = video.get("src")
+        if src:
+            video_url = absolutize(src, instance)
+        elif not video_url and video.get("poster"):
+            add_image(video.get("poster"))
+
+    for link in entry.get("links", []) or []:
+        if link.get("rel") == "enclosure":
+            href = link.get("href", "")
+            media_type = link.get("type", "")
+            if href.startswith("http"):
+                if media_type.startswith("image"):
+                    add_image(href)
+                elif media_type.startswith("video") and not video_url:
+                    video_url = href
+
+    for mc in entry.get("media_content", []) or []:
+        url = mc.get("url")
+        if not url:
+            continue
+        if mc.get("medium") == "video" and not video_url:
+            video_url = url
+        else:
+            add_image(url)
+
+    return images, video_url
+
+
 def parse_entry(entry, instance: str, username: str) -> dict | None:
     link = entry.get("link", "")
     m = re.search(r"/status/(\d+)", link)
@@ -121,7 +187,6 @@ def parse_entry(entry, instance: str, username: str) -> dict | None:
     soup = BeautifulSoup(description_html, "html.parser")
 
     post_type = "original"
-    text = title
     quoted_text = None
     quoted_url = None
 
@@ -130,10 +195,8 @@ def parse_entry(entry, instance: str, username: str) -> dict | None:
 
     if rt:
         post_type = "retweet"
-        text = rt.group(2).strip()
     elif reply:
         post_type = "reply"
-        text = reply.group(2).strip()
     elif soup.find("blockquote"):
         quote_link = soup.find("a", href=re.compile(r"/status/\d+"))
         if quote_link and quote_link.get("href", "") not in link:
@@ -141,20 +204,20 @@ def parse_entry(entry, instance: str, username: str) -> dict | None:
             quoted_url = to_x_url(quote_link["href"], instance)
             quoted_text = quote_link.get_text(strip=True) or None
 
-    images, video_url = [], None
-    for img in soup.find_all("img"):
-        src = img.get("src", "")
-        if src and "emoji" not in src:
-            images.append(absolutize(src, instance))
-    for video in soup.find_all("video"):
-        src = video.get("src") or (video.find("source") or {}).get("src")
-        if src:
-            video_url = absolutize(src, instance)
+    # Prefer the description's text (keeps line breaks); fall back to the title.
+    body_text = extract_body_text(description_html)
+    body_text = _RT_MATCH.sub("", body_text)
+    body_text = _REPLY_MATCH.sub("", body_text)
+    if not body_text:
+        body_text = _RT_MATCH.sub("", title)
+        body_text = _REPLY_MATCH.sub("", body_text)
+
+    images, video_url = extract_media(soup, entry, instance)
 
     return {
         "id": post_id,
         "type": post_type,
-        "text": text or "(no text)",
+        "text": body_text or "(no text)",
         "url": to_x_url(link, instance),
         "created_at": parse_pubdate(entry.get("published")),
         "images": images,
