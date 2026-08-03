@@ -58,9 +58,9 @@ _REPLY_MATCH = re.compile(r"^R\s+to\s+@(\w+):", re.IGNORECASE)
 _STATUS_HREF = re.compile(r'href="([^"]*?/status/(\d+)[^"]*)"')
 
 _TYPE_PREFIX = {
-    "retweet": "🔁 reposted:",
-    "quote": "💬 quoted:",
-    "reply": "↩️ replied:",
+    "retweet": "reposted:",
+    "quote": "quoted:",
+    "reply": "replied:",
 }
 
 
