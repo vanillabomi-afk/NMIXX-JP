@@ -5,10 +5,22 @@ schedule by GitHub Actions (see .github/workflows/check.yml).
 Each run:
     1. Reads state.json to see the last post ID we already posted.
     2. Fetches the monitored account's recent posts from a public Nitter
-       RSS instance (free, no login).
-    3. Posts anything new to a Discord webhook, as a rich embed.
+       RSS instance (free, no login) — just to detect NEW posts and
+       classify their type (original / repost / quote / reply).
+    3. Posts the tweet's link — rewritten to fixupx.com — to a Discord
+       webhook. Discord's own link-unfurling then does all the visual
+       work (image, video, author, text), using fixupx.com's embed data,
+       which is more complete and more reliably formatted than anything
+       we could hand-build ourselves from RSS content.
     4. Updates state.json (committed back to the repo by the workflow),
        so restarts / new runs never repost old content.
+
+Why fixupx.com: x.com/twitter.com links don't unfurl properly in Discord
+on their own (X's own embed metadata is broken for bots). fixupx.com
+(https://github.com/FixTweet/FxTwitter) is a free, actively maintained
+service built specifically to fix this — swap the domain, get a proper
+Discord embed with images, video, and quote-tweet content all handled for
+you.
 
 Configuration comes entirely from environment variables (set as GitHub
 repo secrets — see README.md):
@@ -29,11 +41,9 @@ import sys
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import unquote
 
 import feedparser
 import requests
-from bs4 import BeautifulSoup
 
 STATE_PATH = Path("state.json")
 
@@ -43,8 +53,15 @@ DEFAULT_INSTANCES = [
     "https://xcancel.com",
 ]
 
-_RT_MATCH = re.compile(r"^RT(?:\s+by)?\s+@(\w+):\s*", re.IGNORECASE)
-_REPLY_MATCH = re.compile(r"^R\s+to\s+@(\w+):\s*", re.IGNORECASE)
+_RT_MATCH = re.compile(r"^RT(?:\s+by)?\s+@(\w+):", re.IGNORECASE)
+_REPLY_MATCH = re.compile(r"^R\s+to\s+@(\w+):", re.IGNORECASE)
+_STATUS_HREF = re.compile(r'href="([^"]*?/status/(\d+)[^"]*)"')
+
+_TYPE_PREFIX = {
+    "retweet": "🔁 reposted:",
+    "quote": "💬 quoted:",
+    "reply": "↩️ replied:",
+}
 
 
 def log(msg: str) -> None:
@@ -94,118 +111,28 @@ def parse_pubdate(value: str | None) -> datetime:
         return datetime.now(timezone.utc)
 
 
-def to_x_url(link: str, instance: str) -> str:
+def to_fixupx_url(link: str, instance: str) -> str:
+    """Rewrite a Nitter link into a fixupx.com link, so Discord unfurls it properly."""
     path = link
     if path.startswith(instance):
         path = path[len(instance):]
     elif path.startswith("http"):
         m = re.match(r"https?://[^/]+(/.*)", path)
         path = m.group(1) if m else path
-    return f"https://x.com{path.split('#')[0]}"
+    return f"https://fixupx.com{path.split('#')[0]}"
 
 
-def rewrite_nitter_proxy_url(url: str) -> str:
-    """Nitter proxies media through its own /pic/ or /video/ routes. Public
-    instances are often behind bot-protection that blocks server-to-server
-    fetches — including Discord's own embed crawler — even though the URL
-    works fine in a browser. Unwrap back to the original twimg.com CDN URL
-    when possible, since that's what Discord can reliably fetch and render.
-    """
-    m = re.search(r"/(?:pic|video)/(.+)$", url)
-    if not m:
-        return url
-    decoded = unquote(m.group(1))
-
-    # The decoded remainder may have an extra segment (e.g. a numeric video ID)
-    # before the actual original URL — search for it rather than assuming
-    # it's at the very start.
-    embedded = re.search(r"https?://\S+", decoded)
-    if embedded:
-        return embedded.group(0)
-
-    if decoded.startswith("media/"):
-        return f"https://pbs.twimg.com/{decoded}"
-    if decoded.startswith("ext_tw_video") or decoded.startswith("amplify_video"):
-        return f"https://video.twimg.com/{decoded}"
-    return url
+def detect_quote(description_html: str, own_link: str) -> bool:
+    """A quote-tweet's RSS description contains a link to the quoted status,
+    with an ID different from the post's own — that's the one reliable
+    signal available without needing to parse full HTML."""
+    for href, status_id in _STATUS_HREF.findall(description_html):
+        if status_id not in own_link:
+            return True
+    return False
 
 
-def absolutize(url: str, instance: str) -> str:
-    if url.startswith("http"):
-        return url
-    return f"{instance}{url if url.startswith('/') else '/' + url}"
-
-
-def extract_body_text(description_html: str) -> str:
-    """Pull the tweet's own text out of the RSS description, preserving line breaks.
-
-    RSS titles are flattened to a single line, so we prefer the description's
-    HTML — converting <br> tags to real newlines before stripping markup —
-    to keep the tweet's original formatting.
-    """
-    soup = BeautifulSoup(description_html, "html.parser")
-    for br in soup.find_all("br"):
-        br.replace_with("\n")
-    text = soup.get_text()
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def extract_media(soup: BeautifulSoup, entry, instance: str) -> tuple[list[str], str | None]:
-    """Find images/video from every place Nitter (across versions/instances) tends
-    to put them: inline <img>/<video><source>, and RSS <enclosure> / media:content
-    elements, which some Nitter builds use instead of (or in addition to) inline HTML."""
-    images: list[str] = []
-    video_url: str | None = None
-
-    def add_image(url: str | None) -> None:
-        if not url or "emoji" in url:
-            return
-        rewritten = rewrite_nitter_proxy_url(url)
-        final = rewritten if rewritten != url else absolutize(url, instance)
-        if final not in images:
-            images.append(final)
-
-    for img in soup.find_all("img"):
-        add_image(img.get("src") or img.get("data-src"))
-
-    for source in soup.find_all("source"):
-        candidate = source.get("srcset") or source.get("src")
-        if candidate:
-            add_image(candidate.split(",")[0].strip().split(" ")[0])
-
-    for video in soup.find_all("video"):
-        src = video.get("src")
-        if src:
-            rewritten = rewrite_nitter_proxy_url(src)
-            video_url = rewritten if rewritten != src else absolutize(src, instance)
-        elif not video_url and video.get("poster"):
-            add_image(video.get("poster"))
-
-    for link in entry.get("links", []) or []:
-        if link.get("rel") == "enclosure":
-            href = link.get("href", "")
-            media_type = link.get("type", "")
-            if href.startswith("http"):
-                if media_type.startswith("image"):
-                    add_image(href)
-                elif media_type.startswith("video") and not video_url:
-                    video_url = href
-
-    for mc in entry.get("media_content", []) or []:
-        url = mc.get("url")
-        if not url:
-            continue
-        if mc.get("medium") == "video" and not video_url:
-            video_url = url
-        else:
-            add_image(url)
-
-    return images, video_url
-
-
-def parse_entry(entry, instance: str, username: str) -> dict | None:
+def parse_entry(entry, instance: str) -> dict | None:
     link = entry.get("link", "")
     m = re.search(r"/status/(\d+)", link)
     if not m:
@@ -214,99 +141,43 @@ def parse_entry(entry, instance: str, username: str) -> dict | None:
 
     title = (entry.get("title") or "").strip()
     description_html = entry.get("description") or ""
-    soup = BeautifulSoup(description_html, "html.parser")
 
     post_type = "original"
-    quoted_text = None
-    quoted_url = None
-
-    rt = _RT_MATCH.match(title)
-    reply = _REPLY_MATCH.match(title)
-
-    if rt:
+    if _RT_MATCH.match(title):
         post_type = "retweet"
-    elif reply:
+    elif _REPLY_MATCH.match(title):
         post_type = "reply"
-    elif soup.find("blockquote"):
-        quote_link = soup.find("a", href=re.compile(r"/status/\d+"))
-        if quote_link and quote_link.get("href", "") not in link:
-            post_type = "quote"
-            quoted_url = to_x_url(quote_link["href"], instance)
-            quoted_text = quote_link.get_text(strip=True) or None
-
-    # Prefer the description's text (keeps line breaks); fall back to the title.
-    body_text = extract_body_text(description_html)
-    body_text = _RT_MATCH.sub("", body_text)
-    body_text = _REPLY_MATCH.sub("", body_text)
-    if not body_text:
-        body_text = _RT_MATCH.sub("", title)
-        body_text = _REPLY_MATCH.sub("", body_text)
-
-    images, video_url = extract_media(soup, entry, instance)
+    elif detect_quote(description_html, link):
+        post_type = "quote"
 
     return {
         "id": post_id,
         "type": post_type,
-        "text": body_text or "(no text)",
-        "url": to_x_url(link, instance),
+        "url": to_fixupx_url(link, instance),
         "created_at": parse_pubdate(entry.get("published")),
-        "images": images,
-        "video_url": video_url,
-        "quoted_text": quoted_text,
-        "quoted_url": quoted_url,
     }
 
 
-_TYPE_COLOR = {"original": 0x1DA1F2, "retweet": 0x17BF63, "quote": 0x9146FF, "reply": 0xF45D22}
-_TYPE_LABEL = {"original": "Post", "retweet": "Repost", "quote": "Quote Post", "reply": "Reply"}
-
-
-def build_embed(post: dict, username: str) -> dict:
-    label = _TYPE_LABEL[post["type"]]
-    embed = {
-        "title": f"{label} by @{username}",
-        "description": post["text"][:4096],
-        "url": post["url"],
-        "color": _TYPE_COLOR[post["type"]],
-        "timestamp": post["created_at"].isoformat(),
-        "footer": {"text": f"X (Twitter) • {label}"},
-        "author": {"name": f"@{username}", "url": post["url"]},
-    }
-    if post["type"] == "quote" and post["quoted_text"]:
-        value = post["quoted_text"][:1000]
-        if post["quoted_url"]:
-            value += f"\n[View quoted post]({post['quoted_url']})"
-        embed["fields"] = [{"name": "Quoting", "value": value, "inline": False}]
-    if post["images"]:
-        embed["image"] = {"url": post["images"][0]}
-        if len(post["images"]) > 1:
-            embed.setdefault("fields", []).append(
-                {"name": "Media", "value": f"{len(post['images'])} images — open the post to view all", "inline": False}
-            )
-    return embed
-
-
-def send_to_discord(webhook_url: str, post: dict, embed: dict, mention_role_id: str | None) -> None:
-    content_parts = []
+def build_message(post: dict, username: str, mention_role_id: str | None) -> str:
+    lines = []
     if mention_role_id:
-        content_parts.append(f"<@&{mention_role_id}>")
-    if post["video_url"]:
-        content_parts.append(post["video_url"])  # bare link -> Discord auto-embeds/plays it
+        lines.append(f"<@&{mention_role_id}>")
+    prefix = _TYPE_PREFIX.get(post["type"])
+    if prefix:
+        lines.append(f"**@{username}** {prefix}")
+    lines.append(post["url"])  # on its own line — Discord unfurls a bare link reliably
+    return "\n".join(lines)
 
-    payload = {"embeds": [embed]}
-    if content_parts:
-        payload["content"] = "\n".join(content_parts)
 
-    resp = requests.post(webhook_url, json=payload, timeout=15)
+def send_to_discord(webhook_url: str, content: str) -> None:
+    resp = requests.post(webhook_url, json={"content": content}, timeout=15)
     if resp.status_code == 429:
-        # Discord webhook rate limit — extremely unlikely at a 5-minute poll interval,
-        # but handle it rather than crashing the whole run.
         retry_after = resp.json().get("retry_after", 1)
         log(f"Rate limited by Discord, waiting {retry_after}s")
         import time
 
         time.sleep(retry_after)
-        resp = requests.post(webhook_url, json=payload, timeout=15)
+        resp = requests.post(webhook_url, json={"content": content}, timeout=15)
     resp.raise_for_status()
 
 
@@ -340,7 +211,7 @@ def main() -> int:
     posts = []
     for entry in feed.entries:
         try:
-            p = parse_entry(entry, instance, username)
+            p = parse_entry(entry, instance)
             if p:
                 posts.append(p)
         except Exception as exc:  # noqa: BLE001
@@ -349,8 +220,6 @@ def main() -> int:
     posts.sort(key=lambda p: int(p["id"]))
 
     if last_seen_id is None:
-        # First run ever: don't flood the channel with history — just record
-        # the newest post as the baseline and start posting from the next run.
         if posts:
             state["last_seen_id"] = posts[-1]["id"]
             save_state(state)
@@ -370,15 +239,15 @@ def main() -> int:
     posted = 0
     for post in new_posts:
         try:
-            embed = build_embed(post, username)
-            send_to_discord(webhook_url, post, embed, mention_role_id)
+            content = build_message(post, username, mention_role_id)
+            send_to_discord(webhook_url, content)
             state["last_seen_id"] = post["id"]
-            save_state(state)  # save after each successful post, so a mid-run crash can't cause reposts
+            save_state(state)
             posted += 1
             log(f"Posted {post['type']} {post['id']}")
         except Exception as exc:  # noqa: BLE001
             log(f"ERROR posting {post['id']}: {exc}")
-            break  # stop here; next run will retry this post and any after it
+            break
 
     log(f"Done — posted {posted} new item(s).")
     return 0
