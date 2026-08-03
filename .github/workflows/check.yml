@@ -1,0 +1,46 @@
+name: Check X account and post to Discord
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub may occasionally delay this by a few minutes
+    # under high load — that's a GitHub Actions limitation, not a bug here.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated state.json
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run check
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          X_USERNAME: ${{ secrets.X_USERNAME }}
+          INCLUDE_REPLIES: ${{ secrets.INCLUDE_REPLIES }}
+          MENTION_ROLE_ID: ${{ secrets.MENTION_ROLE_ID }}
+        run: python check_and_post.py
+
+      - name: Save last-seen state
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "xbot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update last seen post [skip ci]"
+            git push
+          else
+            echo "No state change."
+          fi
