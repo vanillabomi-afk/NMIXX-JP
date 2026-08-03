@@ -40,7 +40,11 @@ jobs:
             git config user.email "actions@users.noreply.github.com"
             git add state.json
             git commit -m "Update last seen post [skip ci]"
-            git push
+            for i in 1 2 3 4 5; do
+              git pull --rebase origin main && git push && break
+              echo "Push conflict, retrying ($i)..."
+              sleep $((RANDOM % 5 + 1))
+            done
           else
             echo "No state change."
           fi
