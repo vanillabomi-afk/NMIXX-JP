@@ -3,7 +3,7 @@ check_and_post.py — a single, self-contained script meant to be run on a
 schedule by GitHub Actions (see .github/workflows/check.yml).
 
 Each run:
-    1. Reads state.json to see the last post ID we already posted.
+    1. Reads state.json to see which posts we've already sent to Discord.
     2. Fetches the monitored account's recent posts from a public Nitter
        RSS instance (free, no login) — just to detect NEW posts and
        classify their type (original / repost / quote / reply).
@@ -14,6 +14,13 @@ Each run:
        we could hand-build ourselves from RSS content.
     4. Updates state.json (committed back to the repo by the workflow),
        so restarts / new runs never repost old content.
+
+Dedup is done by remembering the *set* of post IDs already posted, not by
+"anything newer than the last ID" — because X's tweet IDs increase
+globally over time, not per-account, a repost of an older tweet can have a
+numerically lower ID than the account's own recent posts. A simple
+threshold would silently skip those reposts forever; tracking membership
+in a seen-IDs set handles it correctly.
 
 Why fixupx.com: x.com/twitter.com links don't unfurl properly in Discord
 on their own (X's own embed metadata is broken for bots). fixupx.com
@@ -70,11 +77,17 @@ def log(msg: str) -> None:
 
 def load_state() -> dict:
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {"last_seen_id": None}
+        data = json.loads(STATE_PATH.read_text())
+        # Migrate from the old "last_seen_id" single-threshold format, if present.
+        if "seen_ids" not in data:
+            data["seen_ids"] = []
+        return data
+    return {"seen_ids": []}
 
 
 def save_state(state: dict) -> None:
+    # Keep the file small — retain only the most recent 500 IDs.
+    state["seen_ids"] = state["seen_ids"][-500:]
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
@@ -197,9 +210,10 @@ def main() -> int:
         return 1
 
     state = load_state()
-    last_seen_id = state.get("last_seen_id")
+    seen_ids = set(state["seen_ids"])
+    initialized = bool(state.get("initialized"))
 
-    log(f"Checking @{username} (last seen: {last_seen_id or 'none — first run'})")
+    log(f"Checking @{username} ({len(seen_ids)} post(s) already seen)" if initialized else f"Checking @{username} (first run)")
 
     try:
         raw, instance = fetch_rss(username, instances)
@@ -217,18 +231,21 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             log(f"Skipping unparsable entry: {exc}")
 
-    posts.sort(key=lambda p: int(p["id"]))
+    posts.sort(key=lambda p: p["created_at"])
 
-    if last_seen_id is None:
-        if posts:
-            state["last_seen_id"] = posts[-1]["id"]
-            save_state(state)
-            log(f"First run — baseline set to post {posts[-1]['id']}. Nothing posted this run.")
-        else:
-            log("First run — no posts found to baseline against.")
+    if not initialized:
+        # First run ever: record everything currently in the feed as "already
+        # seen" without posting it, so we don't flood the channel with history.
+        # From the next run on, anything not in this set — including a repost
+        # of an old tweet whose ID is numerically lower than others — counts
+        # as new.
+        state["seen_ids"] = [p["id"] for p in posts]
+        state["initialized"] = True
+        save_state(state)
+        log(f"First run — baselined {len(posts)} post(s). Nothing posted this run.")
         return 0
 
-    new_posts = [p for p in posts if int(p["id"]) > int(last_seen_id)]
+    new_posts = [p for p in posts if p["id"] not in seen_ids]
     if not include_replies:
         new_posts = [p for p in new_posts if p["type"] != "reply"]
 
@@ -241,7 +258,7 @@ def main() -> int:
         try:
             content = build_message(post, username, mention_role_id)
             send_to_discord(webhook_url, content)
-            state["last_seen_id"] = post["id"]
+            state["seen_ids"].append(post["id"])
             save_state(state)
             posted += 1
             log(f"Posted {post['type']} {post['id']}")
