@@ -106,7 +106,7 @@ def fetch_rss(
     for instance in instances:
         instance = instance.rstrip("/")
 
-        url = f"{instance}/{username}/rss"
+        url = f"{instance.rstrip('/')}/{username}/rss"
 
         try:
             log(f"Trying RSS instance: {instance}")
