@@ -47,8 +47,7 @@ STATE_PATH = Path("state.json")
 
 # Primary Nitter instance followed by a fallback.
 DEFAULT_INSTANCES = [
-    "https://nitter.perennialte.ch",
-    "https://xcancel.com",
+    "https://nitter.perennialte.ch"
 ]
 
 
