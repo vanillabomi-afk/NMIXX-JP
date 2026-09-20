@@ -104,11 +104,11 @@ def fetch_rss(
 
     for instance in instances:
         instance = instance.rstrip("/")
-
-        url = f"{instance.rstrip('/')}/{username}/rss"
+        url = f"{instance}/{username}/rss"
 
         try:
             log(f"Trying RSS instance: {instance}")
+            log(f"RSS URL: {url}")
 
             response = requests.get(
                 url,
@@ -117,16 +117,41 @@ def fetch_rss(
                     "User-Agent": (
                         "Mozilla/5.0 "
                         "(compatible; xbot-github-action/1.0)"
-                    )
+                    ),
+                    "Accept": (
+                        "application/rss+xml, "
+                        "application/atom+xml, "
+                        "application/xml, "
+                        "text/xml"
+                    ),
                 },
             )
 
-            if response.status_code == 404:
-                raise RuntimeError(
-                    f"@{username} not found on {instance} (404)"
-                )
+            log(f"HTTP status: {response.status_code}")
+            log(
+                f"Content-Type: "
+                f"{response.headers.get('content-type', 'unknown')}"
+            )
 
             response.raise_for_status()
+
+            # Parse immediately to make sure this is actually a feed.
+            test_feed = feedparser.parse(response.content)
+
+            log(
+                f"Feed parser found "
+                f"{len(test_feed.entries)} entr{'y' if len(test_feed.entries) == 1 else 'ies'}"
+            )
+
+            if test_feed.bozo and not test_feed.entries:
+                raise RuntimeError(
+                    "Response was not a valid RSS/Atom feed"
+                )
+
+            if not test_feed.entries:
+                raise RuntimeError(
+                    "RSS request succeeded but returned zero entries"
+                )
 
             log(f"RSS fetch successful: {instance}")
 
