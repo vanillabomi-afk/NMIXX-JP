@@ -25,7 +25,7 @@ Configuration:
 Default Nitter instances:
 
     https://nitter.perennialte.ch
-    https://xcancel.com
+
 """
 
 from __future__ import annotations
