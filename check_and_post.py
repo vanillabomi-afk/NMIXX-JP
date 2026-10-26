@@ -396,18 +396,20 @@ def main() -> int:
             "(first run)"
         )
 
-    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
     # Fetch RSS
     # ------------------------------------------------------------------
 
-        try:
-            # Indented code runs inside try
-            raw, instance = fetch_rss(username, instances)
+    try:
+        raw, instance = fetch_rss(
+            username,
+            instances,
+        )
 
-        except Exception as exc:
-            # Indented code runs if an error occurs
-            log(f"WARNING: RSS check skipped: {exc}")
-            return 0
+    except Exception as exc:
+        log(f"WARNING: RSS check skipped: {exc}")
+        log("Will try again on the next scheduled run.")
+        return 0
 
     # ------------------------------------------------------------------
     # Parse RSS
@@ -418,7 +420,6 @@ def main() -> int:
     posts = []
 
     for entry in feed.entries:
-
         try:
             post = parse_entry(
                 entry,
@@ -429,17 +430,13 @@ def main() -> int:
                 posts.append(post)
 
         except Exception as exc:
-            log(
-                f"Skipping unparsable entry: {exc}"
-            )
+            log(f"Skipping unparsable entry: {exc}")
 
     posts.sort(
         key=lambda post: post["created_at"]
     )
 
-    log(
-        f"Found {len(posts)} post(s) in RSS feed"
-    )
+    log(f"Found {len(posts)} post(s) in RSS feed")
 
     # ------------------------------------------------------------------
     # First run — establish baseline
