@@ -333,14 +333,13 @@ def main() -> int:
     ).strip()
 
     username = (
-        os.environ.get(
-            "X_USERNAME",
-            "",
-        )
-        .strip()
-        .lstrip("@")
-        .lower()
+    os.environ.get(
+        "X_USERNAME",
+        "",
     )
+    .strip()
+    .lstrip("@")
+)
 
     include_replies = (
         os.environ.get(
