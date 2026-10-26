@@ -400,15 +400,16 @@ def main() -> int:
     # Fetch RSS
     # ------------------------------------------------------------------
 
-    try:
+        try:
         raw, instance = fetch_rss(
             username,
             instances,
         )
 
     except Exception as exc:
-        log(f"ERROR: {exc}")
-        return 1
+        log(f"WARNING: RSS check skipped: {exc}")
+        log("Will try again on the next scheduled run.")
+        return 0
 
     # ------------------------------------------------------------------
     # Parse RSS
