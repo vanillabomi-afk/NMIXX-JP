@@ -401,15 +401,13 @@ def main() -> int:
     # ------------------------------------------------------------------
 
         try:
-        raw, instance = fetch_rss(
-            username,
-            instances,
-        )
+            # Indented code runs inside try
+            raw, instance = fetch_rss(username, instances)
 
-    except Exception as exc:
-        log(f"WARNING: RSS check skipped: {exc}")
-        log("Will try again on the next scheduled run.")
-        return 0
+        except Exception as exc:
+            # Indented code runs if an error occurs
+            log(f"WARNING: RSS check skipped: {exc}")
+            return 0
 
     # ------------------------------------------------------------------
     # Parse RSS
